@@ -1,0 +1,6 @@
+# config.py
+
+BOT_TOKEN = "..."
+ADMIN_ID = ... 
+
+DATABASE_URL = "..."
