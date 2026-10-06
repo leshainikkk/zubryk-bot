@@ -1,27 +1,20 @@
+from html import escape
+from .formatting import send_rich
+from .logging import setup_logging
+from .answers import normalize_answer
+from zubryk.sources import word_source
 import logging
 import threading
-import time
-
-import schedule
-import telebot
 from telebot import types
+from zubryk import storage as db
+from zubryk.config import ADMIN_ID
+from .client import bot
+from .keyboards import *
+from .presentation import *
+from .scheduler import loop
 
-from config import BOT_TOKEN, ADMIN_ID
-from old import database as db
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("bel_bot")
-
-bot = telebot.TeleBot(BOT_TOKEN)
-
-db.setup_database()
-
-try:
-    BOT_USERNAME = bot.get_me().username
-except Exception:
-    log.exception("Could not fetch bot username on startup (will retry lazily when needed)")
-    BOT_USERNAME = None
-
+log = logging.getLogger("zubryk.bot")
+BOT_USERNAME = None
 
 def get_bot_username():
     global BOT_USERNAME
@@ -33,134 +26,7 @@ def get_bot_username():
     return BOT_USERNAME
 
 
-HELP_TEXT = (
-    "ℹ️ *Как всё устроено*\n\n"
-    "📚 *Учить новые слова* — выбери тему, слова показываются по одному, "
-    "кнопка «Дальше» открывает следующее.\n"
-    "📝 *Тест* — бот спрашивает перевод слов, которые ты уже изучил(а). "
-    "Пока не изучишь ни одного слова, тест недоступен.\n"
-    "🥔 *Бульба* — внутренняя валюта. Начисляется за игру с друзьями "
-    "и участвует в рейтинге.\n"
-    "🔥 *Стрик* — число дней подряд с занятиями. Пропустишь день целиком — "
-    "серия начнётся заново с 1.\n"
-    "🎮 *Играть с друзьями* — выбери тему, отправь другу ссылку-приглашение. "
-    "Как только он перейдёт по ней — начнётся игра 1 на 1: на каждый раунд "
-    "4 варианта перевода, кто ошибся первым — проиграл, а победитель получает "
-    "дополнительно +30🥔.\n"
-    "⚙️ *Настройки* — время ежедневных слов, имя, поддержка, удаление профиля.\n"
-    "🏆 *Рейтинг* — топ игроков за неделю и за всё время."
-)
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# Клавиатуры и общие helper'ы отображения
-# ─────────────────────────────────────────────────────────────────────────
-
-def home_only_kb():
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("🏠 Главная", callback_data="menu"))
-    return kb
-
-
-def main_menu_kb():
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("📚 Учить новые слова", callback_data="study"))
-    kb.add(types.InlineKeyboardButton("📝 Тест по изученным словам", callback_data="test"))
-    kb.add(types.InlineKeyboardButton("🎮 Играть с друзьями", callback_data="play"))
-    kb.row(
-        types.InlineKeyboardButton("🏆 Рейтинг", callback_data="rating"),
-        types.InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
-        types.InlineKeyboardButton("❓ Помощь", callback_data="help"),
-    )
-    return kb
-
-
-def main_menu_text(uid):
-    user = db.get_or_create_user(uid)
-    name = user["name"] or "Друг"
-    return f"{name}   {user['balance']}🥔  {user['streak']}🔥"
-
-
-def show_main_menu(chat_id):
-    """Главное меню всегда отправляется НОВЫМ сообщением внизу чата, а не
-    заменяет собой старое — чтобы вся история (изученные слова, прошлые
-    экраны) оставалась видна и никуда не пропадала."""
-    bot.send_message(chat_id, main_menu_text(chat_id), reply_markup=main_menu_kb())
-
-
-def send_screen(chat_id, text, kb, parse_mode=None):
-    """Отправляет экран (меню/вопрос/сообщение) ВСЕГДА новым сообщением —
-    старые сообщения в чате не редактируются и не исчезают."""
-    bot.send_message(chat_id, text, reply_markup=kb, parse_mode=parse_mode)
-
-
-def groups_kb(prefix):
-    kb = types.InlineKeyboardMarkup()
-    for g in db.get_groups():
-        kb.add(types.InlineKeyboardButton(g["name"], callback_data=f"{prefix}:{g['key']}"))
-    kb.add(types.InlineKeyboardButton("🏠 Главная", callback_data="menu"))
-    return kb
-
-
-def daily_time_kb(back_to_settings=False):
-    kb = types.InlineKeyboardMarkup()
-    row = []
-    for code, label in db.DAILY_TIME_CHOICES:
-        row.append(types.InlineKeyboardButton(label, callback_data=f"settime:{code}"))
-        if len(row) == 2:
-            kb.row(*row)
-            row = []
-    if row:
-        kb.row(*row)
-    if back_to_settings:
-        kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="settings"))
-    return kb
-
-
-def settings_kb():
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("⏰ Изменение времени", callback_data="settings:time"))
-    kb.add(types.InlineKeyboardButton("✏️ Изменить имя", callback_data="settings:name"))
-    kb.add(types.InlineKeyboardButton("🆘 Поддержка", callback_data="settings:support"))
-    kb.add(types.InlineKeyboardButton("🗑 Удалить профиль", callback_data="settings:delete"))
-    kb.add(types.InlineKeyboardButton("🏠 Главная", callback_data="menu"))
-    return kb
-
-
-def show_settings_menu(chat_id):
-    bot.send_message(chat_id, "⚙️ Настройки", reply_markup=settings_kb())
-
-
-def rating_menu_kb():
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("🔥 За неделю", callback_data="rating:week"),
-        types.InlineKeyboardButton("🥔 За всё время", callback_data="rating:all"),
-    )
-    kb.add(types.InlineKeyboardButton("🏠 Главная", callback_data="menu"))
-    return kb
-
-
-def format_rating(top, me):
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    if not top:
-        lines = ["Пока в рейтинге никого нет."]
-    else:
-        lines = []
-        for uid_, name, amount, rank in top:
-            prefix = medals.get(rank, f"{rank}.")
-            lines.append(f"{prefix} {name or 'Без имени'} — {amount}🥔")
-    if me and (not top or me[3] > top[-1][3]):
-        lines.append("")
-        lines.append(f"Ты: {me[3]} место — {me[2]}🥔")
-    return "\n".join(lines)
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# Регистрация / профиль
-# ─────────────────────────────────────────────────────────────────────────
-
-@bot.message_handler(commands=["start"])
+@bot.message_handler(commands=["start"], chat_types=["private"])
 def cmd_start(message):
     try:
         uid = message.from_user.id
@@ -173,10 +39,21 @@ def cmd_start(message):
 
         user = db.get_or_create_user(uid, message.from_user.first_name or "")
         if user["registered"]:
-            # На всякий случай гарантированно убираем старую кастомную
-            # клавиатуру (например, "следующее" из прошлой версии бота) —
-            # Telegram хранит такую клавиатуру у пользователя, пока ей явно
-            # не пришлют ReplyKeyboardRemove().
+            if payload.startswith("study_"):
+                key=payload[6:]
+                if db.get_group(key):
+                    text,kb=render_study_word(uid,key)
+                    send_screen(message.chat.id,text,kb,parse_mode="HTML")
+                    return
+            if payload=="support":
+                support_start(message.chat.id)
+                return
+            if payload=="settings":
+                show_settings_menu(message.chat.id)
+                return
+            if payload=="play":
+                send_screen(message.chat.id,"Выберите тему игры:",game_groups_kb())
+                return
             bot.send_message(message.chat.id, "👋", reply_markup=types.ReplyKeyboardRemove())
             show_main_menu(message.chat.id)
             return
@@ -217,10 +94,6 @@ def save_new_name(message):
         log.exception("save_new_name failed")
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Учить новые слова
-# ─────────────────────────────────────────────────────────────────────────
-
 def render_study_word(uid, group_key):
     group = db.get_group(group_key)
     word = db.get_next_new_word(uid, group_key)
@@ -234,7 +107,10 @@ def render_study_word(uid, group_key):
 
     word_id, bel, ru = word
     db.mark_word_learned(uid, word_id)
-    text = f"📚 Новое слово:\n\n🇧🇾 {bel}\n🇷🇺 {ru}"
+    text = f"<b>{escape(bel)}</b>\n{escape(ru)}\n\n<i>{escape(group['name']) if group else 'Новое слово'}</i>"
+    source=word_source(bel)
+    if source:
+        text += f'\n\n<a href="{escape(source["url"],quote=True)}">Викисловарь</a> · <a href="{source["licenseUrl"]}">CC BY-SA 4.0</a>'
     kb = types.InlineKeyboardMarkup()
     kb.row(
         types.InlineKeyboardButton("➡️ Дальше", callback_data=f"sg:{group_key}"),
@@ -242,10 +118,6 @@ def render_study_word(uid, group_key):
     )
     return text, kb
 
-
-# ─────────────────────────────────────────────────────────────────────────
-# Тест по изученным словам
-# ─────────────────────────────────────────────────────────────────────────
 
 def start_test_flow(chat_id, uid):
     count = db.start_test(uid)
@@ -265,31 +137,27 @@ def ask_next_test_word(chat_id, uid):
         bot.send_message(chat_id, "Тест завершён! Отличная работа 🔥", reply_markup=home_only_kb())
         return
     word_id, bel, ru = word
-    # Кнопка "Главная" позволяет выйти из теста в любой момент, не отвечая на
-    # вопрос. Если её нажать, _safe_clear_step() отменит ожидание текстового
-    # ответа для этого вопроса, чтобы следующее сообщение пользователя не
-    # было случайно принято за ответ теста.
-    msg = bot.send_message(chat_id, f"Как будет по-белорусски:\n🇷🇺 {ru}", reply_markup=home_only_kb())
+    msg = bot.send_message(chat_id, f"<b>Как будет по-белорусски?</b>\n\n{escape(ru)}", parse_mode="HTML", reply_markup=home_only_kb())
     bot.register_next_step_handler(msg, check_test_answer, word_id, bel)
 
 
 def check_test_answer(message, word_id, correct_bel):
     try:
         uid = message.from_user.id
-        answer = (message.text or "").strip().lower()
-        correct = answer == correct_bel.strip().lower()
+        answer = normalize_answer(message.text or "")
+        correct = answer == normalize_answer(correct_bel)
         db.record_test_answer(uid, word_id, correct)
         if correct:
-            bot.send_message(message.chat.id, f"✅ Правильно!\n{correct_bel}")
+            bot.send_message(message.chat.id, f"<b>Правильно!</b>\n{escape(correct_bel)}", parse_mode="HTML")
         else:
-            bot.send_message(message.chat.id, f"❌ Неправильно.\nПравильный ответ: {correct_bel}")
+            bot.send_message(message.chat.id, f"<b>Есть ошибка.</b>\nПравильный ответ: {escape(correct_bel)}", parse_mode="HTML")
         db.pop_test_word(uid)
         ask_next_test_word(message.chat.id, uid)
     except Exception:
         log.exception("check_test_answer failed")
 
 
-@bot.message_handler(commands=["test"])
+@bot.message_handler(commands=["test"], chat_types=["private"])
 def cmd_test(message):
     try:
         uid = message.from_user.id
@@ -299,11 +167,10 @@ def cmd_test(message):
         log.exception("cmd_test failed")
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Поддержка (/support, сохранено для совместимости)
-# ─────────────────────────────────────────────────────────────────────────
-
 def support_start(chat_id):
+    if not ADMIN_ID:
+        bot.send_message(chat_id,"Поддержка пока не подключена. Продолжить обучение можно через главное меню.",reply_markup=home_only_kb())
+        return
     msg = bot.send_message(chat_id, "Опишите вашу проблему. Я передам её разработчику.")
     bot.register_next_step_handler(msg, support_collect)
 
@@ -326,24 +193,12 @@ def support_collect(message):
         log.exception("support_collect failed")
 
 
-@bot.message_handler(commands=["support"])
+@bot.message_handler(commands=["support"], chat_types=["private"])
 def cmd_support(message):
     try:
         support_start(message.chat.id)
     except Exception:
         log.exception("cmd_support failed")
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# Игра 1×1 с друзьями
-# ─────────────────────────────────────────────────────────────────────────
-
-def game_groups_kb():
-    kb = types.InlineKeyboardMarkup()
-    for g in db.get_groups():
-        kb.add(types.InlineKeyboardButton(g["name"], callback_data=f"pg:{g['key']}"))
-    kb.add(types.InlineKeyboardButton("🏠 Главная", callback_data="menu"))
-    return kb
 
 
 def send_round_to_player(target_uid, game_id, round_info):
@@ -384,7 +239,6 @@ def handle_game_deeplink(message, token):
         bot.send_message(chat_id, "Ты уже в этой игре.", reply_markup=home_only_kb())
         return
 
-    # res == "joined"
     game_id = result["game_id"]
     player1_id = result["player1_id"]
     bot.send_message(player1_id, "🎮 Игра началась! Второй игрок подключился.")
@@ -419,8 +273,6 @@ def handle_game_answer(call, uid, chat_id, data):
         bot.answer_callback_query(call.id, "Ты уже отвечал(а) в этом раунде.", show_alert=True)
         return
 
-    # любой другой исход — снимаем клавиатуру с этого сообщения, чтобы
-    # нельзя было нажать дважды
     try:
         bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
     except Exception:
@@ -454,12 +306,11 @@ def handle_game_answer(call, uid, chat_id, data):
         return
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Единый обработчик inline-кнопок
-# ─────────────────────────────────────────────────────────────────────────
-
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
+    if not call.message or call.message.chat.type != "private":
+        bot.answer_callback_query(call.id,"Откройте бота в личном чате")
+        return
     uid = call.from_user.id
     chat_id = call.message.chat.id
     data = call.data or ""
@@ -475,11 +326,6 @@ def handle_callback(call):
 
 
 def _safe_clear_step(chat_id):
-    """Отменяет ранее зарегистрированный register_next_step_handler для этого
-    чата (например, бот ждал ответ теста или новое имя текстом). Вызывается
-    при любом нажатии inline-кнопки, чтобы пользователь мог в любой момент
-    уйти в другое меню, а следующее обычное сообщение не было по ошибке
-    воспринято как "ответ" на давно неактуальный вопрос."""
     try:
         bot.clear_step_handler_by_chat_id(chat_id)
     except Exception:
@@ -489,6 +335,15 @@ def _safe_clear_step(chat_id):
 def _dispatch_callback(call, uid, chat_id, data):
     db.get_or_create_user(uid)
     _safe_clear_step(chat_id)
+
+    if data.startswith("groups:"):
+        _,prefix,page=data.split(":")
+        if prefix not in ("sg","pg"):
+            bot.answer_callback_query(call.id)
+            return
+        bot.answer_callback_query(call.id)
+        bot.edit_message_reply_markup(chat_id,call.message.message_id,reply_markup=groups_kb(prefix,int(page)))
+        return
 
     if data == "menu":
         bot.answer_callback_query(call.id)
@@ -508,7 +363,7 @@ def _dispatch_callback(call, uid, chat_id, data):
         bot.answer_callback_query(call.id)
         group_key = data.split(":", 1)[1]
         text, kb = render_study_word(uid, group_key)
-        send_screen(chat_id, text, kb)
+        send_screen(chat_id, text, kb, parse_mode="HTML")
         return
 
     if data == "test":
@@ -561,14 +416,14 @@ def _dispatch_callback(call, uid, chat_id, data):
         bot.answer_callback_query(call.id)
         top, me = db.get_rating_weekly(uid)
         text = "🔥 Рейтинг за неделю:\n\n" + format_rating(top, me)
-        send_screen(chat_id, text, rating_menu_kb())
+        send_screen(chat_id, text, rating_menu_kb(), parse_mode="HTML")
         return
 
     if data == "rating:all":
         bot.answer_callback_query(call.id)
         top, me = db.get_rating_alltime(uid)
         text = "🥔 Рейтинг за всё время:\n\n" + format_rating(top, me)
-        send_screen(chat_id, text, rating_menu_kb())
+        send_screen(chat_id, text, rating_menu_kb(), parse_mode="HTML")
         return
 
     if data == "settings":
@@ -596,7 +451,7 @@ def _dispatch_callback(call, uid, chat_id, data):
         bot.answer_callback_query(call.id)
         kb = types.InlineKeyboardMarkup()
         kb.row(
-            types.InlineKeyboardButton("Да, удалить", callback_data="delete:yes"),
+            types.InlineKeyboardButton("Да, удалить", callback_data="delete:yes", style="danger"),
             types.InlineKeyboardButton("Отмена", callback_data="delete:no"),
         )
         send_screen(
@@ -623,10 +478,7 @@ def _dispatch_callback(call, uid, chat_id, data):
         db.set_daily_time(uid, code)
         label = db.daily_time_label(None if code == "off" else code)
         bot.answer_callback_query(call.id, f"Сохранено: {label}")
-        # reply_markup=ReplyKeyboardRemove() отправляется гарантированно (не
-        # внутри except), чтобы окончательно убрать старую кастомную
-        # клавиатуру прошлой версии бота ("следующее" и т.п.), если она у
-        # пользователя ещё осталась.
+
         bot.send_message(
             chat_id,
             f"Готово! Ежедневные слова: {label}.",
@@ -637,52 +489,42 @@ def _dispatch_callback(call, uid, chat_id, data):
 
     if data == "help":
         bot.answer_callback_query(call.id)
-        send_screen(chat_id, HELP_TEXT, home_only_kb(), parse_mode="Markdown")
+        send_rich(bot,chat_id,
+            "<h2>Как устроен Зубрик</h2><p>Небольшие занятия помогают сделать беларускую частью дня.</p>"
+            "<h3>Слова и повторение</h3><p>Выберите тему и открывайте новые слова. Тест в чате проверяет уже изученное.</p>"
+            "<h3>Ваше приложение</h3><p>Прогресс, грамматика, учебные задания для подготовки к ЦТ / ЦЭ и общие настройки.</p>"
+            "<details><summary>Игры, награды и серия дней</summary><p>Отправьте другу приглашение. Правильный ответ даёт 1 бульбен, победа — ещё 30. Новое изученное слово поддерживает серию дней.</p></details>",
+            "<b>Как устроен Зубрик</b>\n\nУчите слова и повторяйте их в чате. В Mini App — ваш прогресс, грамматика и учебные задания.\n\nИгры с друзьями приносят бульбены. Новое слово поддерживает серию дней.",home_only_kb())
         return
 
-    # неизвестный callback — просто закрываем "часики", ничего не меняем
     bot.answer_callback_query(call.id)
 
-
-# ─────────────────────────────────────────────────────────────────────────
-# Ежедневная рассылка (у каждого пользователя своё время)
-# ─────────────────────────────────────────────────────────────────────────
-
-def send_daily_words_for_time(code):
-    for uid in db.get_users_due_for_daily(code):
-        try:
-            words = db.get_next_new_words_multi(uid, limit=5)
-            if not words:
-                bot.send_message(
-                    uid,
-                    "🏁 Ты уже изучил(а) все слова во всех темах! Загляни в «Играть с друзьями» 🎮",
-                )
-                db.mark_daily_sent(uid)
-                continue
-
-            lines = []
-            for word_id, bel, ru in words:
-                db.mark_word_learned(uid, word_id)
-                lines.append(f"🇧🇾 {bel}\n🇷🇺 {ru}")
-
-            bot.send_message(uid, "📚 Твои сегодняшние слова:\n\n" + "\n\n".join(lines))
-            db.mark_daily_sent(uid)
-        except Exception:
-            log.exception("Failed to send daily words to user %s", uid)
+@bot.message_handler(commands=["app"],chat_types=["private"])
+def cmd_app(message):
+    from zubryk.config import get_mini_app_url
+    url=get_mini_app_url()
+    kb=types.InlineKeyboardMarkup()
+    if url:
+        kb.add(types.InlineKeyboardButton("Открыть Зубрик",web_app=types.WebAppInfo(url),style="primary"))
+        bot.send_message(message.chat.id,"<b>Зубрик</b>\n\nВаш прогресс, грамматика и подготовка к ЦТ / ЦЭ.",parse_mode="HTML",reply_markup=kb)
+    else:
+        show_main_menu(message.chat.id)
 
 
-def loop():
-    for code, _label in db.DAILY_TIME_CHOICES:
-        if code == "off":
-            continue
-        hhmm = f"{code[:2]}:{code[2:]}"
-        schedule.every().day.at(hhmm).do(send_daily_words_for_time, code)
-
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+@bot.message_handler(commands=["help"],chat_types=["private"])
+def cmd_help(message):
+    bot.send_message(message.chat.id,"<b>Как устроен Зубрик</b>\n\nУчите слова и повторяйте их в чате. Приложение открывается кнопкой «Зубрик» в меню: там грамматика, упражнения и ваш прогресс.\n\nИгры с друзьями приносят бульбены. Новое слово поддерживает серию дней.",parse_mode="HTML",reply_markup=main_menu_kb())
 
 
-if __name__ == "__main__":
+def run():
+    setup_logging()
+    from .runtime import acquire_polling_lock
+    polling_lock=acquire_polling_lock()
+    db.setup_database()
     threading.Thread(target=loop, daemon=True).start()
-    bot.polling(none_stop=True, timeout=60)
+    import importlib.metadata
+    log.info("Bot polling started (pyTelegramBotAPI %s)",importlib.metadata.version("pyTelegramBotAPI"))
+    try:
+        bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=False)
+    finally:
+        polling_lock.close()
