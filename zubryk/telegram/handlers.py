@@ -1,8 +1,7 @@
 from html import escape
-from .formatting import send_rich
+from . import cards
 from .logging import setup_logging
 from .answers import normalize_answer
-from zubryk.sources import word_source
 import logging
 import threading
 from telebot import types
@@ -42,8 +41,7 @@ def cmd_start(message):
             if payload.startswith("study_"):
                 key=payload[6:]
                 if db.get_group(key):
-                    text,kb=render_study_word(uid,key)
-                    send_screen(message.chat.id,text,kb,parse_mode="HTML")
+                    show_study_word(message.chat.id, uid, key)
                     return
             if payload=="support":
                 support_start(message.chat.id)
@@ -52,16 +50,18 @@ def cmd_start(message):
                 show_settings_menu(message.chat.id)
                 return
             if payload=="play":
-                send_screen(message.chat.id,"Выберите тему игры:",game_groups_kb())
+                send_screen(message.chat.id, cards.topics_text(for_game=True), game_groups_kb())
                 return
-            bot.send_message(message.chat.id, "👋", reply_markup=types.ReplyKeyboardRemove())
             show_main_menu(message.chat.id)
             return
 
-        msg = bot.send_message(
+        msg = send_screen(
             message.chat.id,
-            "Здравствуйте! Как вас зовут?",
-            reply_markup=types.ReplyKeyboardRemove(),
+            "🌿 <b>Прывітанне! Я Зубрык.</b>\n\n"
+            "Помогу учить беларускую по несколько слов в день. "
+            "Здесь можно повторять слова и играть с друзьями.\n\n"
+            "<b>Как тебя зовут?</b> Напиши своё имя.",
+            types.ReplyKeyboardRemove(),
         )
         bot.register_next_step_handler(msg, save_name)
     except Exception:
@@ -70,14 +70,16 @@ def cmd_start(message):
 
 def save_name(message):
     try:
+        if _route_pending_command(message):
+            return
         uid = message.from_user.id
         name = (message.text or "").strip()[:64] or "Без имени"
         db.get_or_create_user(uid)
         db.set_name(uid, name)
-        bot.send_message(
+        send_screen(
             message.chat.id,
-            f"Приятно познакомиться, {name}! Когда присылать тебе слово дня?",
-            reply_markup=daily_time_kb(),
+            f"Прыемна пазнаёміцца, <b>{escape(name)}</b>!\n\n" + cards.time_text(onboarding=True),
+            daily_time_kb(),
         )
     except Exception:
         log.exception("save_name failed")
@@ -85,74 +87,84 @@ def save_name(message):
 
 def save_new_name(message):
     try:
+        if _route_pending_command(message):
+            return
         uid = message.from_user.id
         name = (message.text or "").strip()[:64] or "Без имени"
         db.set_name(uid, name)
-        bot.send_message(message.chat.id, f"Имя изменено на {name}.")
-        show_settings_menu(message.chat.id)
+        show_settings_menu(message.chat.id, notice=f"Имя сохранено: {name}")
     except Exception:
         log.exception("save_new_name failed")
 
 
 def render_study_word(uid, group_key):
     group = db.get_group(group_key)
+    if not group:
+        return "📚 <b>Тема недоступна</b>\n\nВыбери другую тему для изучения.", groups_kb("sg"), None
     word = db.get_next_new_word(uid, group_key)
     if not word:
-        group_name = group["name"] if group else group_key
+        group_name = escape(group["name"])
         text = (
-            f"🎉 В теме «{group_name}» пока закончились новые слова!\n\n"
-            f"Выбери другую тему или вернись на главную."
+            f"🎉 <b>Тема пройдена!</b>\n<i>{group_name}</i>\n\n"
+            "Все её слова уже знакомы. Выбери новую тему или проверь себя в тесте."
         )
-        return text, groups_kb("sg")
+        return text, groups_kb("sg"), None
 
     word_id, bel, ru = word
-    db.mark_word_learned(uid, word_id)
-    text = f"<b>{escape(bel)}</b>\n{escape(ru)}\n\n<i>{escape(group['name']) if group else 'Новое слово'}</i>"
-    source=word_source(bel)
-    if source:
-        text += f'\n\n<a href="{escape(source["url"],quote=True)}">Викисловарь</a> · <a href="{source["licenseUrl"]}">CC BY-SA 4.0</a>'
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("➡️ Дальше", callback_data=f"sg:{group_key}"),
-        types.InlineKeyboardButton("🏠 Главная", callback_data="menu"),
-    )
-    return text, kb
+    return cards.study_word_text(bel, ru, group["name"]), study_word_kb(group_key), word_id
 
 
-def start_test_flow(chat_id, uid):
+def show_study_word(chat_id, uid, group_key):
+    text, kb, word_id = render_study_word(uid, group_key)
+    msg = send_screen(chat_id, text, kb)
+    if word_id is not None:
+        db.mark_word_learned(uid, word_id)
+    return msg
+
+
+def start_test_flow(chat_id, uid, *, message=None):
+    _safe_clear_step(chat_id)
     count = db.start_test(uid)
     if count == 0:
-        bot.send_message(
+        send_screen(
             chat_id,
-            "Ты пока не изучил ни одного слова. Сначала изучи новые слова.",
-            reply_markup=home_only_kb(),
+            "📝 <b>Начнём с новых слов</b>\n\n"
+            "Тест проверяет то, что ты уже изучил. "
+            "Открой несколько слов — и возвращайся сюда.",
+            test_result_kb(), message=message,
         )
         return
-    ask_next_test_word(chat_id, uid)
+    ask_next_test_word(chat_id, uid, total=count, message=message)
 
 
-def ask_next_test_word(chat_id, uid):
+def ask_next_test_word(chat_id, uid, *, total=0, completed=0, correct_count=0, feedback=None, message=None):
     word = db.get_next_test_word(uid)
     if not word:
-        bot.send_message(chat_id, "Тест завершён! Отличная работа 🔥", reply_markup=home_only_kb())
+        send_screen(chat_id, cards.test_result_text(correct_count, completed, feedback), test_result_kb(), message=message)
         return
     word_id, bel, ru = word
-    msg = bot.send_message(chat_id, f"<b>Как будет по-белорусски?</b>\n\n{escape(ru)}", parse_mode="HTML", reply_markup=home_only_kb())
-    bot.register_next_step_handler(msg, check_test_answer, word_id, bel)
+    msg = send_screen(chat_id, cards.test_question_text(ru, completed + 1, total, feedback), home_only_kb(), message=message)
+    bot.register_next_step_handler(msg, check_test_answer, word_id, bel, total, completed, correct_count)
 
 
-def check_test_answer(message, word_id, correct_bel):
+def check_test_answer(message, word_id, correct_bel, total=0, completed=0, correct_count=0):
     try:
+        if _route_pending_command(message):
+            return
         uid = message.from_user.id
+        if not message.text:
+            msg = send_screen(message.chat.id, "✍️ Напиши перевод <b>текстовым сообщением</b>.", home_only_kb())
+            bot.register_next_step_handler(msg, check_test_answer, word_id, correct_bel, total, completed, correct_count)
+            return
         answer = normalize_answer(message.text or "")
         correct = answer == normalize_answer(correct_bel)
         db.record_test_answer(uid, word_id, correct)
-        if correct:
-            bot.send_message(message.chat.id, f"<b>Правильно!</b>\n{escape(correct_bel)}", parse_mode="HTML")
-        else:
-            bot.send_message(message.chat.id, f"<b>Есть ошибка.</b>\nПравильный ответ: {escape(correct_bel)}", parse_mode="HTML")
         db.pop_test_word(uid)
-        ask_next_test_word(message.chat.id, uid)
+        ask_next_test_word(
+            message.chat.id, uid, total=total, completed=completed + 1,
+            correct_count=correct_count + int(correct),
+            feedback=cards.test_feedback_text(correct, correct_bel),
+        )
     except Exception:
         log.exception("check_test_answer failed")
 
@@ -169,14 +181,16 @@ def cmd_test(message):
 
 def support_start(chat_id):
     if not ADMIN_ID:
-        bot.send_message(chat_id,"Поддержка пока не подключена. Продолжить обучение можно через главное меню.",reply_markup=home_only_kb())
+        send_screen(chat_id, "💬 <b>Поддержка</b>\n\nПоддержка пока не подключена. Продолжить обучение можно через главное меню.", home_only_kb())
         return
-    msg = bot.send_message(chat_id, "Опишите вашу проблему. Я передам её разработчику.")
+    msg = send_screen(chat_id, "💬 <b>Напиши разработчику</b>\n\nОпиши проблему одним сообщением. Я передам твоё обращение.", home_only_kb())
     bot.register_next_step_handler(msg, support_collect)
 
 
 def support_collect(message):
     try:
+        if _route_pending_command(message):
+            return
         uid = message.from_user.id
         db.get_or_create_user(uid, message.from_user.first_name or "")
         text = message.text
@@ -184,10 +198,10 @@ def support_collect(message):
             ADMIN_ID,
             f"🆘 Новое сообщение в поддержку:\nОт пользователя: {uid}\nТекст:\n{text}",
         )
-        bot.send_message(
+        send_screen(
             message.chat.id,
-            "Ваше обращение отправлено. Спасибо! Я скоро посмотрю.",
-            reply_markup=home_only_kb(),
+            "✅ <b>Обращение отправлено</b>\n\nСпасибо! Разработчик получит твоё сообщение.",
+            home_only_kb(),
         )
     except Exception:
         log.exception("support_collect failed")
@@ -205,9 +219,9 @@ def send_round_to_player(target_uid, game_id, round_info):
     kb = types.InlineKeyboardMarkup()
     for opt_id, ru in round_info["options"]:
         kb.add(types.InlineKeyboardButton(ru, callback_data=f"ga:{game_id}:{round_info['round']}:{opt_id}"))
-    text = f"Как переводится слово:\n«{round_info['word_bel']}»"
+    text = cards.game_round_text(round_info['word_bel'], round_info['round'])
     try:
-        bot.send_message(target_uid, text, reply_markup=kb)
+        send_screen(target_uid, text, kb)
     except Exception:
         log.exception("Failed to send round to player %s", target_uid)
 
@@ -220,13 +234,13 @@ def handle_game_deeplink(message, token):
     res = result["result"]
 
     if res == "not_found":
-        bot.send_message(chat_id, "Ссылка недействительна или игра уже закрыта.", reply_markup=home_only_kb())
+        send_screen(chat_id, "🎮 <b>Приглашение устарело</b>\n\nЭта игра уже закрыта или ссылка недействительна. Создай новую дуэль.", home_only_kb())
         return
     if res == "not_waiting":
-        bot.send_message(chat_id, "Эта игра уже идёт или завершена другими игроками.", reply_markup=home_only_kb())
+        send_screen(chat_id, "🎮 <b>Дуэль уже началась</b>\n\nЭта игра идёт или уже завершена. Можно создать новую.", home_only_kb())
         return
     if res == "full":
-        bot.send_message(chat_id, "В этой игре уже два игрока.", reply_markup=home_only_kb())
+        send_screen(chat_id, "🎮 <b>Комната заполнена</b>\n\nВ этой игре уже два игрока. Создай свою дуэль.", home_only_kb())
         return
     if res == "already_in":
         game_id = result["game_id"]
@@ -241,8 +255,8 @@ def handle_game_deeplink(message, token):
 
     game_id = result["game_id"]
     player1_id = result["player1_id"]
-    bot.send_message(player1_id, "🎮 Игра началась! Второй игрок подключился.")
-    bot.send_message(chat_id, "🎮 Игра началась!")
+    send_screen(player1_id, "🎮 <b>Соперник подключился!</b>\n\nДуэль начинается. Удачи обоим!")
+    send_screen(chat_id, "🎮 <b>Ты в игре!</b>\n\nДуэль начинается. Удачи обоим!")
 
     round_info = db.start_round(game_id)
     if not round_info:
@@ -282,12 +296,13 @@ def handle_game_answer(call, uid, chat_id, data):
         bot.answer_callback_query(call.id, "❌ Неправильно! Игра окончена.")
         loser_id = result["loser_id"]
         winner_id = result.get("winner_id")
-        bot.send_message(loser_id, "❌ Неправильный ответ. Ты проиграл(а) эту игру.", reply_markup=home_only_kb())
+        send_screen(loser_id, "🏁 <b>Дуэль завершена</b>\n\nВ этот раз победил соперник. Ещё одна игра — ещё одна возможность потренироваться.", home_only_kb())
         if winner_id:
-            bot.send_message(
+            send_screen(
                 winner_id,
-                "🏆 Соперник ошибся! Ты победил(а) в игре и получаешь дополнительно +30🥔!",
-                reply_markup=home_only_kb(),
+                "🏆 <b>Перамога!</b>\n\nСоперник ошибся — эта дуэль твоя.\n\n"
+                "<blockquote>Бонус за победу: <b>+30 🥔</b></blockquote>",
+                home_only_kb(),
             )
         return
 
@@ -332,9 +347,31 @@ def _safe_clear_step(chat_id):
         pass
 
 
+def _retire_keyboard(message):
+    try:
+        bot.edit_message_reply_markup(message.chat.id, message.message_id, reply_markup=None)
+    except Exception:
+        log.debug("Could not remove keyboard from a previous card", exc_info=True)
+
+
+def _route_pending_command(message):
+    text = (message.text or "").strip()
+    if not text.startswith("/"):
+        return False
+    command = text.split()[0].split("@", 1)[0]
+    handler = {"/start": cmd_start, "/test": cmd_test, "/help": cmd_help, "/app": cmd_app, "/support": cmd_support}.get(command)
+    if handler:
+        _safe_clear_step(message.chat.id)
+        handler(message)
+    else:
+        show_main_menu(message.chat.id)
+    return True
+
+
 def _dispatch_callback(call, uid, chat_id, data):
-    db.get_or_create_user(uid)
-    _safe_clear_step(chat_id)
+    if data == "noop":
+        bot.answer_callback_query(call.id)
+        return
 
     if data.startswith("groups:"):
         _,prefix,page=data.split(":")
@@ -342,42 +379,45 @@ def _dispatch_callback(call, uid, chat_id, data):
             bot.answer_callback_query(call.id)
             return
         bot.answer_callback_query(call.id)
-        bot.edit_message_reply_markup(chat_id,call.message.message_id,reply_markup=groups_kb(prefix,int(page)))
+        send_screen(chat_id, cards.topics_text(for_game=prefix == "pg"), groups_kb(prefix, int(page)), message=call.message)
         return
+
+    user = db.get_or_create_user(uid)
+    _safe_clear_step(chat_id)
 
     if data == "menu":
         bot.answer_callback_query(call.id)
-        show_main_menu(chat_id)
+        show_main_menu(chat_id, message=call.message)
         return
 
     if data == "study":
         bot.answer_callback_query(call.id)
         groups = db.get_groups()
         if not groups:
-            send_screen(chat_id, "Пока нет доступных тем для изучения.", home_only_kb())
+            send_screen(chat_id, "📚 <b>Темы скоро появятся</b>\n\nПока нет доступных тем для изучения.", home_only_kb(), message=call.message)
         else:
-            send_screen(chat_id, "Выбери тему для изучения:", groups_kb("sg"))
+            send_screen(chat_id, cards.topics_text(), groups_kb("sg"), message=call.message)
         return
 
     if data.startswith("sg:"):
         bot.answer_callback_query(call.id)
         group_key = data.split(":", 1)[1]
-        text, kb = render_study_word(uid, group_key)
-        send_screen(chat_id, text, kb, parse_mode="HTML")
+        show_study_word(chat_id, uid, group_key)
+        _retire_keyboard(call.message)
         return
 
     if data == "test":
         bot.answer_callback_query(call.id)
-        start_test_flow(chat_id, uid)
+        start_test_flow(chat_id, uid, message=call.message)
         return
 
     if data == "play":
         bot.answer_callback_query(call.id)
         groups = db.get_groups()
         if not groups:
-            send_screen(chat_id, "Пока нет доступных тем для игры.", home_only_kb())
+            send_screen(chat_id, "🎮 <b>Темы скоро появятся</b>\n\nПока нет доступных тем для игры.", home_only_kb(), message=call.message)
         else:
-            send_screen(chat_id, "Выбери тему для игры с другом:", game_groups_kb())
+            send_screen(chat_id, cards.topics_text(for_game=True), game_groups_kb(), message=call.message)
         return
 
     if data.startswith("pg:"):
@@ -390,55 +430,46 @@ def _dispatch_callback(call, uid, chat_id, data):
         username = get_bot_username()
         if username:
             link = f"https://t.me/{username}?start=g_{token}"
-            text = (
-                "Комната создана! Отправь эту ссылку другу:\n"
-                f"{link}\n\n"
-                "Как только он перейдёт по ней — игра начнётся."
-            )
+            group = db.get_group(group_key)
+            text = cards.invitation_text(group["name"] if group else group_key, link)
+            kb = invitation_kb(link)
         else:
             text = (
-                "Комната создана, но не удалось получить имя бота для ссылки. "
+                "🎮 <b>Не удалось подготовить приглашение</b>\n\n"
                 "Попробуй ещё раз чуть позже."
             )
-        send_screen(chat_id, text, home_only_kb())
+            kb = home_only_kb()
+        send_screen(chat_id, text, kb, message=call.message)
         return
 
     if data.startswith("ga:"):
         handle_game_answer(call, uid, chat_id, data)
         return
 
-    if data == "rating":
+    if data in ("rating", "rating:week", "rating:all"):
         bot.answer_callback_query(call.id)
-        send_screen(chat_id, "🏆 Рейтинг", rating_menu_kb())
-        return
-
-    if data == "rating:week":
-        bot.answer_callback_query(call.id)
-        top, me = db.get_rating_weekly(uid)
-        text = "🔥 Рейтинг за неделю:\n\n" + format_rating(top, me)
-        send_screen(chat_id, text, rating_menu_kb(), parse_mode="HTML")
-        return
-
-    if data == "rating:all":
-        bot.answer_callback_query(call.id)
-        top, me = db.get_rating_alltime(uid)
-        text = "🥔 Рейтинг за всё время:\n\n" + format_rating(top, me)
-        send_screen(chat_id, text, rating_menu_kb(), parse_mode="HTML")
+        weekly = data != "rating:all"
+        top, me = db.get_rating_weekly(uid) if weekly else db.get_rating_alltime(uid)
+        title = "За неделю" if weekly else "За всё время"
+        text = f"🏆 <b>Рейтинг</b>\n<i>{title}</i>\n\n" + format_rating(top, me)
+        send_screen(chat_id, text, rating_menu_kb("week" if weekly else "all"), message=call.message)
         return
 
     if data == "settings":
         bot.answer_callback_query(call.id)
-        send_screen(chat_id, "⚙️ Настройки", settings_kb())
+        show_settings_menu(chat_id, message=call.message)
         return
 
     if data == "settings:time":
         bot.answer_callback_query(call.id)
-        send_screen(chat_id, "Выбери время ежедневных слов:", daily_time_kb(back_to_settings=True))
+        send_screen(chat_id, cards.time_text(), daily_time_kb(back_to_settings=True, selected=user["daily_time"]), message=call.message)
         return
 
     if data == "settings:name":
         bot.answer_callback_query(call.id)
-        msg = bot.send_message(chat_id, "Введи новое имя:")
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("‹ Настройки", callback_data="settings"))
+        msg = send_screen(chat_id, "✏️ <b>Как тебя называть?</b>\n\nНапиши новое имя одним сообщением.", kb, message=call.message)
         bot.register_next_step_handler(msg, save_new_name)
         return
 
@@ -456,21 +487,21 @@ def _dispatch_callback(call, uid, chat_id, data):
         )
         send_screen(
             chat_id,
-            "⚠️ Вы действительно хотите удалить профиль?\n"
-            "Прогресс, баланс Бульбы и streak будут удалены безвозвратно.",
-            kb,
+            "🗑 <b>Удалить профиль?</b>\n\n"
+            "Прогресс, баланс бульбы и серия дней будут удалены. Восстановить их не получится.",
+            kb, message=call.message,
         )
         return
 
     if data == "delete:yes":
         db.delete_user(uid)
         bot.answer_callback_query(call.id, "Профиль удалён.")
-        bot.send_message(chat_id, "Профиль удалён. Напиши /start, чтобы начать заново.")
+        send_screen(chat_id, "🗑 <b>Профиль удалён</b>\n\nНапиши /start, чтобы начать заново.", message=call.message)
         return
 
     if data == "delete:no":
         bot.answer_callback_query(call.id)
-        send_screen(chat_id, "⚙️ Настройки", settings_kb())
+        show_settings_menu(chat_id, message=call.message)
         return
 
     if data.startswith("settime:"):
@@ -479,22 +510,15 @@ def _dispatch_callback(call, uid, chat_id, data):
         label = db.daily_time_label(None if code == "off" else code)
         bot.answer_callback_query(call.id, f"Сохранено: {label}")
 
-        bot.send_message(
-            chat_id,
-            f"Готово! Ежедневные слова: {label}.",
-            reply_markup=types.ReplyKeyboardRemove(),
-        )
-        show_main_menu(chat_id)
+        if user["registered"]:
+            show_settings_menu(chat_id, message=call.message, notice="Рассылка отключена" if code == "off" else f"Слова дня: {label}")
+        else:
+            show_main_menu(chat_id, message=call.message)
         return
 
     if data == "help":
         bot.answer_callback_query(call.id)
-        send_rich(bot,chat_id,
-            "<h2>Как устроен Зубрик</h2><p>Небольшие занятия помогают сделать беларускую частью дня.</p>"
-            "<h3>Слова и повторение</h3><p>Выберите тему и открывайте новые слова. Тест в чате проверяет уже изученное.</p>"
-            "<h3>Ваше приложение</h3><p>Прогресс, грамматика, учебные задания для подготовки к ЦТ / ЦЭ и общие настройки.</p>"
-            "<details><summary>Игры, награды и серия дней</summary><p>Отправьте другу приглашение. Правильный ответ даёт 1 бульбен, победа — ещё 30. Новое изученное слово поддерживает серию дней.</p></details>",
-            "<b>Как устроен Зубрик</b>\n\nУчите слова и повторяйте их в чате. В Mini App — ваш прогресс, грамматика и учебные задания.\n\nИгры с друзьями приносят бульбены. Новое слово поддерживает серию дней.",home_only_kb())
+        show_help(chat_id, message=call.message)
         return
 
     bot.answer_callback_query(call.id)
@@ -505,15 +529,16 @@ def cmd_app(message):
     url=get_mini_app_url()
     kb=types.InlineKeyboardMarkup()
     if url:
-        kb.add(types.InlineKeyboardButton("Открыть Зубрик",web_app=types.WebAppInfo(url),style="primary"))
-        bot.send_message(message.chat.id,"<b>Зубрик</b>\n\nВаш прогресс, грамматика и подготовка к ЦТ / ЦЭ.",parse_mode="HTML",reply_markup=kb)
+        kb.add(types.InlineKeyboardButton("🌿 Открыть приложение",web_app=types.WebAppInfo(url),style="primary"))
+        kb.add(types.InlineKeyboardButton("🏠 Главная", callback_data="menu"))
+        send_screen(message.chat.id, "🌿 <b>Зубрык всегда под рукой</b>\n\nТвой прогресс, грамматика и подготовка к ЦТ / ЦЭ — в приложении.", kb)
     else:
         show_main_menu(message.chat.id)
 
 
 @bot.message_handler(commands=["help"],chat_types=["private"])
 def cmd_help(message):
-    bot.send_message(message.chat.id,"<b>Как устроен Зубрик</b>\n\nУчите слова и повторяйте их в чате. Приложение открывается кнопкой «Зубрик» в меню: там грамматика, упражнения и ваш прогресс.\n\nИгры с друзьями приносят бульбены. Новое слово поддерживает серию дней.",parse_mode="HTML",reply_markup=main_menu_kb())
+    show_help(message.chat.id)
 
 
 def run():

@@ -10,3 +10,5 @@ frontend/dist/
 *.log
 .DS_Store
 *.tsbuildinfo
+~$*
+xcuserdata/

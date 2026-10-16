@@ -1,58 +1,54 @@
 from html import escape
-from .formatting import send_rich
-from zubryk import storage as db
-from .client import bot
-from .keyboards import *
 
-HELP_TEXT = (
-    "ℹ️ *Как всё устроено*\n\n"
-    "📚 *Учить новые слова* — выбери тему, слова показываются по одному, "
-    "кнопка «Дальше» открывает следующее.\n"
-    "📝 *Тест* — бот спрашивает перевод слов, которые ты уже изучил(а). "
-    "Пока не изучишь ни одного слова, тест недоступен.\n"
-    "🥔 *Бульба* — внутренняя валюта. Начисляется за игру с друзьями "
-    "и участвует в рейтинге.\n"
-    "🔥 *Стрик* — число дней подряд с занятиями. Пропустишь день целиком — "
-    "серия начнётся заново с 1.\n"
-    "🎮 *Играть с друзьями* — выбери тему, отправь другу ссылку-приглашение. "
-    "Как только он перейдёт по ней — начнётся игра 1 на 1: на каждый раунд "
-    "4 варианта перевода, кто ошибся первым — проиграл, а победитель получает "
-    "дополнительно +30🥔.\n"
-    "⚙️ *Настройки* — время ежедневных слов, имя, поддержка, удаление профиля.\n"
-    "🏆 *Рейтинг* — топ игроков за неделю и за всё время."
-)
+from zubryk import storage as db
+from . import cards
+from .client import bot
+from .formatting import send_html, send_rich
+from .keyboards import main_menu_kb, settings_kb, home_only_kb
+
 
 def main_menu_text(uid):
-    user = db.get_or_create_user(uid)
-    name = escape(user["name"] or "Друг")
-    return f"<b>Прывітанне, {name}!</b>\n\n{user['balance']} 🥔 · {user['streak']} 🔥\n\nСлова и игры — в чате. Грамматика и ваш прогресс — в приложении."
+    return cards.main_menu_text(db.get_or_create_user(uid))
 
 
-def show_main_menu(chat_id):
+def show_main_menu(chat_id, *, message=None):
     user = db.get_or_create_user(chat_id)
-    name = escape(user["name"] or "Друг")
-    rich = f"<h2>Прывітанне, {name}!</h2><p><b>{user['balance']} 🥔</b> · <b>{user['streak']} 🔥</b></p><p>Слова и игры — в чате. Грамматика и ваш прогресс — в приложении.</p>"
-    return send_rich(bot, chat_id, rich, main_menu_text(chat_id), main_menu_kb())
+    return send_rich(
+        bot, chat_id, cards.main_menu_rich(user), cards.main_menu_text(user),
+        main_menu_kb(), message=message,
+    )
 
 
-def send_screen(chat_id, text, kb, parse_mode=None):
-    bot.send_message(chat_id, text, reply_markup=kb, parse_mode=parse_mode)
+def send_screen(chat_id, text, kb=None, *, message=None):
+    return send_html(bot, chat_id, text, kb, message=message)
 
 
-def show_settings_menu(chat_id):
-    bot.send_message(chat_id, "⚙️ Настройки", reply_markup=settings_kb())
+def show_settings_menu(chat_id, *, message=None, notice=None):
+    user = db.get_or_create_user(chat_id)
+    return send_screen(
+        chat_id, cards.settings_text(user, db.daily_time_label(user['daily_time']), notice=notice),
+        settings_kb(), message=message,
+    )
+
+
+def show_help(chat_id, *, message=None):
+    return send_rich(
+        bot, chat_id, cards.HELP_RICH, cards.HELP_TEXT,
+        home_only_kb(), message=message,
+    )
 
 
 def format_rating(top, me):
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    if not top:
-        lines = ["Пока в рейтинге никого нет."]
-    else:
-        lines = []
-        for uid_, name, amount, rank in top:
-            prefix = medals.get(rank, f"{rank}.")
-            lines.append(f"{prefix} {escape(name or 'Без имени')} — {amount}🥔")
-    if me and (not top or me[3] > top[-1][3]):
-        lines.append("")
-        lines.append(f"Ты: {me[3]} место — {me[2]}🥔")
-    return "\n".join(lines)
+    medals = {1: '🥇', 2: '🥈', 3: '🥉'}
+    lines = []
+    for uid, name, amount, rank in top:
+        prefix = medals.get(rank, f'{rank}.')
+        label = escape(name or 'Без имени')
+        if me and uid == me[0]:
+            label = f'<b>{label} · ты</b>'
+        lines.append(f'{prefix} {label} — <b>{cards.number(amount)}</b> 🥔')
+    if not lines:
+        lines.append('Пока здесь пусто. Сыграй с другом, чтобы попасть в рейтинг.')
+    if me and not any(row[0] == me[0] for row in top):
+        lines.append(f'\n<blockquote>Твоё место: <b>{me[3]}</b> · <b>{cards.number(me[2])}</b> 🥔</blockquote>')
+    return '\n'.join(lines)

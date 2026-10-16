@@ -5,8 +5,9 @@ from zubryk import storage as db
 from zubryk.config import TIMEZONE
 from .client import bot
 from .formatting import send_rich
-from html import escape
-from zubryk.sources import word_source
+from .cards import daily_words_card
+from .keyboards import daily_words_kb, home_only_kb
+from .formatting import send_html
 
 log=logging.getLogger("zubryk.scheduler")
 
@@ -15,26 +16,16 @@ def send_daily_words_for_time(code):
         try:
             words = db.get_next_new_words_multi(uid, limit=5)
             if not words:
-                bot.send_message(
+                send_html(bot,
                     uid,
-                    "🏁 Ты уже изучил(а) все слова во всех темах! Загляни в «Играть с друзьями» 🎮",
+                    "🏁 <b>Весь словарь пройден!</b>\n\nПовтори изученное в тесте или сыграй с другом.",
+                    home_only_kb(),
                 )
                 db.mark_daily_sent(uid)
                 continue
 
-            lines = []
-            for word_id, bel, ru in words:
-                lines.append(f"<b>{escape(bel)}</b>\n{escape(ru)}")
-
-            rich="<h2>Ваши слова на сегодня</h2>"+"".join(f"<p><b>{escape(bel)}</b><br>{escape(ru)}</p>" for _,bel,ru in words)
-            fallback="<b>Ваши слова на сегодня</b>\n\n"+"\n\n".join(lines)
-            credited=[word_source(bel) for _,bel,_ in words]
-            if any(credited):
-                credit=' · '.join(f'<a href="{escape(source["url"],quote=True)}">{index+1}</a>' for index,source in enumerate(credited) if source)
-                footer=f'Викисловарь: {credit} · <a href="https://creativecommons.org/licenses/by-sa/4.0/">CC BY-SA 4.0</a>'
-                rich+=f"<p>{footer}</p>"
-                fallback+="\n\n"+footer
-            send_rich(bot,uid,rich,fallback)
+            rich, fallback = daily_words_card(words)
+            send_rich(bot, uid, rich, fallback, daily_words_kb())
             for word_id,_,_ in words:
                 db.mark_word_learned(uid,word_id)
             db.mark_daily_sent(uid)
